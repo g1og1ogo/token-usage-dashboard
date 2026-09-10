@@ -17,6 +17,9 @@
 ```bash
 # 用户级安装：放到 skills 目录即可
 cp -r token-usage-dashboard ~/.workbuddy/skills/
+
+# 或直接克隆到 skills 目录
+git clone https://github.com/g1og1ogo/token-usage-dashboard.git ~/.workbuddy/skills/token-usage-dashboard
 ```
 
 环境要求：Python 3.9+（用到 `X | None` 类型语法与 dict 保序）。依赖：无。
@@ -83,7 +86,18 @@ python scripts/dashboard.py \
 
 仓库已内置 `.gitignore` 兜底：`*.html` 与 `*.json` 默认忽略，只放行 `references/` 下的两个模板。
 
+推送前请跑一键自检，别靠肉眼：
+
+```bash
+bash scripts/check_private.sh .
+```
+
+扫五类高危项：本机用户名路径、业务专有名词、PII 与凭据（邮箱/手机/身份证/信用代码/私钥/AK/SK/`ghp_` token）、
+本地工作路径、未清理产物。全通过才退出 0。
+
 ## License
 
-未附带 License 文件，默认保留所有权利。如需以 MIT 等协议开源，请自行添加 `LICENSE`
-并把作者名改成你自己——本仓库不含任何可识别的个人信息，但也不替你做许可决定。
+MIT，见 `LICENSE`。作者名可按你的情况修改。
+
+注意：Git 的 commit 作者邮箱会永久留在公开历史中，建议在目标仓库单独设置身份，
+或使用 GitHub 提供的 noreply 邮箱（`<id>+<login>@users.noreply.github.com`）。
