@@ -18,9 +18,12 @@
 # 用户级安装：放到 skills 目录即可
 cp -r token-usage-dashboard ~/.workbuddy/skills/
 
-# 或直接克隆到 skills 目录
+# 或直接克隆到 skills 目录（二选一）
 git clone https://github.com/g1og1ogo/token-usage-dashboard.git ~/.workbuddy/skills/token-usage-dashboard
+git clone https://gitee.com/myworkbuddy/token-usage-dashboard.git  ~/.workbuddy/skills/token-usage-dashboard
 ```
+
+> 两个平台的第一个 release 内容完全相同；GitHub 主站，`gitee.com/myworkbuddy` 为国内镜像。
 
 环境要求：Python 3.9+（用到 `X | None` 类型语法与 dict 保序）。依赖：无。
 
