@@ -1,0 +1,17 @@
+{
+  "_说明": "模型单价表（单位：元 / 百万 token）。本模板中的数值全部是【占位样例】，不代表任何厂商的真实价格，脚本也不会内置任何价格。使用前请用你自己的合同价或厂商官网现价替换，并在看板脚注注明价格来源与生效日期。字段：match 支持子串或正则（对模型名转小写后再匹配）；input 全量输入单价；cached_input 缓存命中部分单价（留空则按 input × cached_discount 计算）；output 普通输出单价；reasoning 思考 token 单价（留空则按 output 计算）。defaults 为兜底规则。",
+  "defaults": {
+    "input": 2.0,
+    "cached_input": null,
+    "cached_discount": 0.1,
+    "output": 8.0,
+    "reasoning": null
+  },
+  "models": [
+    { "match": "opus", "input": 40.0, "cached_input": 4.0, "output": 200.0, "reasoning": 200.0 },
+    { "match": "sonnet", "input": 8.0, "cached_input": 0.8, "output": 40.0, "reasoning": 40.0 },
+    { "match": "haiku", "input": 2.0, "cached_input": 0.2, "output": 10.0, "reasoning": 10.0 },
+    { "match": "gpt-5|o[13]|o4", "input": 7.0, "cached_input": 0.7, "output": 28.0, "reasoning": 28.0 },
+    { "match": "qwen|glm|deepseek|kimi", "input": 2.0, "cached_input": 0.2, "output": 8.0, "reasoning": 8.0 }
+  ]
+}

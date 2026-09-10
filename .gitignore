@@ -1,0 +1,24 @@
+# 重要：以下文件**禁止**入库
+
+# 1. 看板产物 —— 含真实消耗数据与用户会话原文（实测含姓名 / 身份证号 / 企业信用代码）
+*.html
+*.json
+
+# 2. 例外：技能自带的参考配置必须入库（模板已脱敏，不得替换成真实业务词典）
+!references/biz_rules.example.json
+!references/price.example.json
+
+# 3. 私有词典 / 真实单价 —— 一旦填写成型，等于公开业务布局与采购条件
+biz_rules_private*.json
+price_real*.json
+_private/
+
+# 4. 通用忽略
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.bak
+*.bak.html
