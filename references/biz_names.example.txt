@@ -1,0 +1,22 @@
+# 隐私自检词表模板
+#
+# 用法：把本文件复制到技能目录**之外**再改写，然后 check_private.sh 会自动加载。
+#
+#   mkdir -p ~/.token-dashboard
+#   cp references/biz_names.example.txt ~/.token-dashboard/biz_names.txt
+#   # 编辑 ~/.token-dashboard/biz_names.txt，一行一个词
+#
+#   cp references/biz_names.example.txt ~/.token-dashboard/local_paths.txt
+#   # 同上，一行一个本机路径特征
+#
+# ★ 为什么不直接写进 check_private.sh：
+#   那个脚本会随技能一起推到 GitHub / Gitee。把真实客户名、对手方、未公开项目代号
+#   写进一个公开文件，等于把业务布局公告出去——而这恰恰是本脚本要防的事。
+#
+# 语法：一行一个词；以 # 开头的行忽略；空行忽略。按正则片段处理，含特殊字符需转义。
+
+# ---- 示例（这些是占位符，替换成你自己的）----
+客户甲
+客户乙
+项目代号示例
+交易对手方示例

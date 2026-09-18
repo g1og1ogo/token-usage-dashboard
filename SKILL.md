@@ -124,6 +124,17 @@ bash scripts/check_private.sh .        # 干净会输出「可以发布」并以
 它会扫五类：本机用户名路径、业务专有名词、PII/凭据（邮箱、手机、身份证、信用代码、私钥、AK/SK、ghp_ token）、
 本地工作路径、未清理的运行产物。命中会列出文件名与行内容，退出码非 0。
 
+**业务专名与本机路径两张词表不在脚本里**，默认从仓库之外读取：
+
+```
+~/.token-dashboard/biz_names.txt      一行一个业务专名（客户、对手方、项目代号）
+~/.token-dashboard/local_paths.txt    一行一个本机路径特征
+```
+
+模板见 `references/biz_names.example.txt`；可用 `BIZ_NAMES_FILE` / `LOCAL_PATHS_FILE` 覆盖路径。
+**不要把这些词写回 `check_private.sh`**——那个脚本本身会随技能公开，写进去就是用防泄漏的工具制造泄漏。
+词表缺失时脚本打印 `[SKIP]` 并给出创建命令，不会静默放过。
+
 想手工核也行：
 
 ```bash
@@ -158,6 +169,7 @@ git status --porcelain                        # 确认没有把 HTML/JSON 产物
 
 - `scripts/dashboard.py` — 单文件采集 + 归因 + 渲染，零第三方依赖
 - `scripts/check_private.sh` — 发布/分享前的一键隐私自检，五类高危项扫描，命中则非零退出
+- `references/biz_names.example.txt` — 隐私自检词表模板（**复制到 `~/.token-dashboard/` 再改写，别就地改**）
 - `references/biz_rules.example.json` — 业务主线词典模板（**应复制改写，不要就地改**）
 - `references/price.example.json` — 单价表模板，数值为占位样例，须替换为用户实际价格
 - `references/pitfalls.md` — 实测坑位与硬约束（改脚本前必读）

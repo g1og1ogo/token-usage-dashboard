@@ -13,6 +13,11 @@ biz_rules_private*.json
 price_real*.json
 _private/
 
+# 3.5 隐私自检词表 —— 只允许 example 入库；真实词表必须放仓库外（~/.token-dashboard/）
+biz_names.txt
+local_paths.txt
+!references/biz_names.example.txt
+
 # 4. 通用忽略
 __pycache__/
 *.py[cod]
