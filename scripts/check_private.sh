@@ -19,6 +19,8 @@ echo "检查目标: $(pwd)"
 echo "======================================"
 
 flag=0
+# git 可用环境变量：GIT=/path/to/git 后所有 git 调用改用它（不依赖 PATH）
+GITBIN="${GIT:-git}"
 
 check() {
   local name="$1" pat="$2" flags="${3:--E}"
@@ -66,7 +68,7 @@ echo "---- 4. 本地工作路径 ----"
 # 你的本机工作目录同样属于不该公开的信息，和业务词表放同一份清单里（前缀 local:）
 LOCAL_PATHS_FILE="${LOCAL_PATHS_FILE:-$HOME/.token-dashboard/local_paths.txt}"
 if [ -f "$LOCAL_PATHS_FILE" ]; then
-  local_pat=$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$LOCAL_PATHS_FILE" | tr '\n' '|' | sed 's/|$//')
+  local_pat=$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$LOCAL_PATHS_FILE" | tr -d '\r' | tr '\n' '|' | sed 's/|$//')
   if [ -n "$local_pat" ]; then
     check "本机工作路径（词表: $LOCAL_PATHS_FILE）" "$local_pat"
   else
@@ -77,30 +79,72 @@ else
 fi
 
 echo "---- 5. 运行产物（应被 .gitignore 拦住） ----"
-echo "  （仅提示，不影响结论；下方「Git 是否真的忽略」才是判据）"
-found=$(find . -name '*.html' -not -path './.git/*' 2>/dev/null | wc -l)
-foundj=$(find . \( -name 'biz_rules_private.json' -o -name 'price_real.json' \) -not -path './.git/*' 2>/dev/null | wc -l)
-if [ "$found" -gt 0 ] || [ "$foundj" -gt 0 ]; then
-  printf "  [INFO]  发现 %s 个 html / %s 个私有 json，用 git 判定它们是否会被入库:\n" "$found" "$foundj"
+# ★ 判定前提：目标必须是 git 仓库，且机器上找得到 git 命令。
+#   - 非仓库时 git check-ignore 一律返回非 0，会把「不在仓库内」误判成「会入库」——
+#     于是任何合法 html（例如技能自带的 HTML 模板）都会把闸门打成红。
+#     闸门长期误红 ⇒ 使用者开始忽略它 ⇒ 真泄漏时也没人看。这类假红必须消灭。
+#   - 找不到 git 命令时（未安装 / 不在 PATH），「会不会入库」同样无法判定：
+#     真实仓库会被 git rev-parse 的失败误判成「非仓库」，整类静默跳过、退出码 0——
+#     这是假绿，比假红危险得多。判定原则：无法判定 ≠ 通过，宁可拦下人工确认。
+#   可用环境变量 GIT=/path/to/git 指定 git 位置后重试。
+GIT_MISSING=0
+IN_GIT=0
+if ! command -v "$GITBIN" >/dev/null 2>&1; then
+  GIT_MISSING=1
+elif "$GITBIN" rev-parse --git-dir >/dev/null 2>&1; then
+  IN_GIT=1
+fi
+
+# 免检清单：随技能一起发布的模板/示例等，显式声明后不参与本类判定。
+# 格式：一行一个相对路径或 glob，# 开头忽略。只写中性文件名，不得写业务名。
+# ★ 必须 tr -d '\r'：Windows 记事本/编辑器存成 CRLF 时，行尾 \r 会被当成
+#   模式的一部分（'assets/*.html\r'），匹配永远失败 → 静默漏检（假绿）。
+#   假绿比假红危险得多，所以所有词表读取都要吃掉 \r。
+ALLOW_FILE="./.privacy-allow"
+allow_hit() {
+  [ -f "$ALLOW_FILE" ] || return 1
+  local f="${1#./}" a
+  while IFS= read -r a; do
+    case "$a" in ''|'#'*) continue ;; esac
+    case "$f" in $a) return 0 ;; esac
+  done < <(tr -d '\r' < "$ALLOW_FILE")
+  return 1
+}
+
+artifacts=$(find . \( -name '*.html' -o -name 'biz_rules_private.json' -o -name 'price_real.json' \) -not -path './.git/*' 2>/dev/null)
+if [ -z "$artifacts" ]; then
+  printf "  [ OK ]  无产物残留\n"
+elif [ "$GIT_MISSING" -eq 1 ]; then
+  printf "  [WARN]  找不到 git 命令（可设 GIT=/path/to/git 覆盖），无法判定产物是否会入库\n"
+  printf "           → 按未通过处理，请人工确认以下候选:\n"
+  printf '%s\n' "$artifacts" | sed 's/^/           候选  /'
+  flag=1
+elif [ "$IN_GIT" -eq 0 ]; then
+  printf "  [INFO]  非 git 仓库，「入库」无判定语义 → 本类仅列出候选，不参与结论:\n"
+  printf '%s\n' "$artifacts" | sed 's/^/           候选  /'
+else
   leaked=0
   while IFS= read -r f; do
-    if git check-ignore -q "$f" 2>/dev/null; then
+    [ -n "$f" ] || continue
+    if allow_hit "$f"; then
+      printf "           已豁免  %s（见 .privacy-allow）\n" "$f"
+    elif "$GITBIN" check-ignore -q "$f" 2>/dev/null; then
       printf "           已忽略  %s\n" "$f"
     else
       printf "           **会入库** %s\n" "$f"
       leaked=1
     fi
-  done < <(find . \( -name '*.html' -o -name 'biz_rules_private.json' -o -name 'price_real.json' \) -not -path './.git/*' 2>/dev/null)
+  done <<< "$artifacts"
   [ "$leaked" -eq 1 ] && flag=1
-else
-  printf "  [ OK ]  无产物残留\n"
 fi
 
 echo "---- 6. Git 暂存/跟踪区实际会发布的文件 ----"
-if git rev-parse --git-dir >/dev/null 2>&1; then
-  tracked=$(git ls-files | wc -l)
+if [ "$GIT_MISSING" -eq 1 ]; then
+  printf "  [INFO]  找不到 git 命令，跳过（可设 GIT=/path/to/git 覆盖）\n"
+elif [ "$IN_GIT" -eq 1 ]; then
+  tracked=$("$GITBIN" ls-files | wc -l)
   printf "  [INFO]  将被推送的文件 %s 个:\n" "$tracked"
-  git ls-files | sed 's/^/           /'
+  "$GITBIN" ls-files | sed 's/^/           /'
 else
   printf "  [INFO]  非 git 仓库，跳过\n"
 fi
