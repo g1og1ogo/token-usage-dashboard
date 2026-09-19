@@ -392,6 +392,85 @@ def collect(args, biz: dict[str, list[str]]) -> dict:
     }
 
 
+# ---------------------------------------------------------------- 跨期对比
+def load_prev_snapshot(path: str) -> dict:
+    """读取上一次 --json-out 导出的快照，做跨期（环比）对比。
+
+    快照与本期的结构一致（data["agg"] + data["meta"]），因此任意一份历史
+    --json-out 产物都可以作为对比基准。缺字段时按空处理，不中断本期报表。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except OSError as e:
+        raise SystemExit(f"[x] 对比快照读取失败：{e}")
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"[x] 对比快照不是合法 JSON（应为上次 --json-out 的产物）：{path}\n    {e}")
+    if not isinstance(data, dict) or not isinstance(data.get("agg"), dict):
+        raise SystemExit(f"[x] 对比快照结构不符：缺少 agg 字段（{path}）")
+    return data
+
+
+def build_compare(cur: dict, prev: dict) -> dict:
+    """对比本期与上期快照：业务主线级别的 token 增减、新增/消失主线、整体口径变化。"""
+    ca, pa = cur["agg"], prev.get("agg") or {}
+    pmeta = prev.get("meta") or {}
+
+    def _biz_tot(agg: dict, b: str) -> int:
+        return agg.get("biz_input", {}).get(b, 0) + agg.get("biz_output", {}).get(b, 0)
+
+    def _sum(agg: dict, key: str) -> int:
+        return sum(agg.get(key, {}).values()) if isinstance(agg.get(key), dict) else 0
+
+    cur_keys = set(ca.get("biz_input", {}))
+    prev_keys = set(pa.get("biz_input", {}))
+    # 上期快照合法但一条已归因主线都没有：此时「新增」没有基准，
+    # 若照旧逐条标注，会把全部主线都打成"新增"、结论完全失真。
+    # → 只提示核对基准，本期不做新增/已结束判定。
+    prev_empty = not prev_keys
+    rows = []
+    for b in cur_keys | prev_keys:
+        ct, pt = _biz_tot(ca, b), _biz_tot(pa, b)
+        rows.append({
+            "biz": b,
+            "cur": ct,
+            "prev": pt,
+            "delta": ct - pt,
+            "pct": (100.0 * (ct - pt) / pt) if pt else None,  # 上期为 0：无意义，置 None
+            "status": "both" if prev_empty else
+                      ("new" if b not in prev_keys else ("gone" if b not in cur_keys else "both")),
+        })
+    # 本期消耗大的排前面；两边都为 0 的主线（理论上不存在）沉底
+    rows.sort(key=lambda r: -max(r["cur"], r["prev"]))
+
+    c_in, p_in = _sum(ca, "biz_input"), _sum(pa, "biz_input")
+    c_out, p_out = _sum(ca, "biz_output"), _sum(pa, "biz_output")
+    c_cch, p_cch = _sum(ca, "biz_cached"), _sum(pa, "biz_cached")
+    c_rsn, p_rsn = _sum(ca, "biz_reasoning"), _sum(pa, "biz_reasoning")
+    c_all, p_all = c_in + c_out, p_in + p_out
+
+    since, until = str(pmeta.get("since") or ""), str(pmeta.get("until") or "")
+    label = f"{since} ~ {until}" if (since or until) else str(pmeta.get("generated_at") or "上期快照")
+
+    return {
+        "label": label,
+        "rows": rows,
+        "cur_total": c_all,
+        "prev_total": p_all,
+        "total_delta": c_all - p_all,
+        "total_pct": (100.0 * (c_all - p_all) / p_all) if p_all else None,
+        "cur_cache": 100.0 * c_cch / c_in if c_in else None,
+        "prev_cache": 100.0 * p_cch / p_in if p_in else None,
+        "cur_reason": 100.0 * c_rsn / c_out if c_out else None,
+        "prev_reason": 100.0 * p_rsn / p_out if p_out else None,
+        "cur_sessions": _sum(ca, "biz_sessions"),
+        "prev_sessions": _sum(pa, "biz_sessions"),
+        "new_lines": [r["biz"] for r in rows if r["status"] == "new"],
+        "gone_lines": [r["biz"] for r in rows if r["status"] == "gone"],
+        "prev_empty": prev_empty,
+    }
+
+
 def new_agg() -> dict:
     return {
         "biz_input": defaultdict(int), "biz_output": defaultdict(int),
@@ -776,6 +855,111 @@ def render_insight(a: dict, meta: dict, args) -> str:
     return f'<div class="panel"><h2>综合洞察 <span class="tag">阈值可调，见 --help</span></h2>{body}</div>'
 
 
+def render_compare(cmp: dict | None, pal: list[str]) -> str:
+    """跨期对比面板：业务主线级 token 环比、新增/消失主线、整体口径变化。"""
+    if not cmp:
+        return ""
+
+    def _pct_cell(pct):
+        if pct is None:
+            return '<td class="num" style="color:var(--fg3)">—</td>'
+        cls = "var(--a6)" if pct < 0 else ("var(--a7)" if pct > 0 else "var(--fg3)")
+        sign = "+" if pct > 0 else ""
+        return f'<td class="num" style="color:{cls};white-space:nowrap">{sign}{pct:.1f}%</td>'
+
+    def _delta_cell(delta):
+        cls = "var(--a6)" if delta < 0 else ("var(--a7)" if delta > 0 else "var(--fg3)")
+        sign = "+" if delta > 0 else ("-" if delta < 0 else "")
+        # fmt() 只处理非负数，负值取绝对值后自行补符号
+        return f'<td class="num" style="color:{cls};white-space:nowrap">{sign}{fmt(abs(delta))}</td>'
+
+    rows = []
+    for i, r in enumerate(cmp["rows"]):
+        c = pal[i % len(pal)]
+        if r["status"] == "new":
+            tag = '<span class="badge" style="background:#4d7c0f18;color:#4d7c0f">🆕 新增</span>'
+        elif r["status"] == "gone":
+            tag = '<span class="badge" style="background:#79839c18;color:var(--fg3)">已结束</span>'
+        else:
+            tag = ""
+        rows.append(f"""<tr>
+<td><span class="dot" style="background:{c}"></span>{E(r['biz'])} {tag}</td>
+<td class="num">{fmt(r['cur'])}</td>
+<td class="num">{fmt(r['prev'])}</td>
+{_delta_cell(r['delta'])}
+{_pct_cell(r['pct'])}
+</tr>""")
+
+    def _trend(cur_v, prev_v, suffix="%", nd="—", mode="cost"):
+        # 配色语义（与告警方向保持一致，避免"配色说好、告警说坏"）：
+        #   cost    = 升红降绿（默认）：消耗类指标涨了是坏事
+        #   good_up = 升绿降红：缓存命中率涨了省成本，是好事（告警规则正是"下降≥10pp 才 warn"）
+        #   neutral = 不着色：思考占比、活跃会话数没有明确好坏方向，交给读者判断
+        if cur_v is None or prev_v is None:
+            return nd
+        d = cur_v - prev_v
+        arrow = "▲" if d > 0 else ("▼" if d < 0 else "＝")
+        if mode == "neutral":
+            cls = "var(--fg3)"
+        elif mode == "good_up":
+            cls = "var(--a6)" if d > 0 else ("var(--a7)" if d < 0 else "var(--fg3)")
+        else:
+            cls = "var(--a6)" if d < 0 else ("var(--a7)" if d > 0 else "var(--fg3)")
+        return (f'<b>{cur_v:g}{suffix}</b> <span style="color:{cls}">{arrow}{abs(d):g}</span>'
+                f'<span style="color:var(--fg3)">（上期 {prev_v:g}{suffix}）</span>')
+
+    notes = []
+    if cmp.get("prev_empty"):
+        notes.append(("warn", "上期快照中没有任何已归因主线——可能是上期区间无数据、或两期用了不同词典。"
+                              "请先核对对比基准是否正确；本期不做「新增 / 已结束」判定"))
+    if cmp["new_lines"]:
+        notes.append(("ok", f"🆕 <b>新增主线</b>：{'、'.join(E(b) for b in cmp['new_lines'])} —— 本期首次出现消耗"))
+    if cmp["gone_lines"]:
+        notes.append(("info", f"已结束主线：{'、'.join(E(b) for b in cmp['gone_lines'])} —— 上期有消耗、本期为零，可确认是业务结束还是归因遗漏"))
+    if cmp["total_pct"] is not None and abs(cmp["total_pct"]) >= 30:
+        direction = "增长" if cmp["total_pct"] > 0 else "下降"
+        notes.append(("warn" if cmp["total_pct"] > 0 else "info",
+                      f"总消耗环比{direction} <b>{abs(cmp['total_pct']):.0f}%</b>"
+                      f"（{fmt(cmp['prev_total'])} → {fmt(cmp['cur_total'])}），幅度超过 30%，建议核对是否有一次性大任务或统计口径变化"))
+    if cmp["cur_cache"] is not None and cmp["prev_cache"] is not None and cmp["cur_cache"] - cmp["prev_cache"] <= -10:
+        notes.append(("warn", f"缓存命中率环比下降 <b>{cmp['prev_cache'] - cmp['cur_cache']:.1f} 个百分点</b>，"
+                              f"可能是上下文频繁变更，降本空间正在流失"))
+    if not notes:
+        notes.append(("ok", "各业务线环比无显著异常"))
+
+    icon = {"warn": "▲", "info": "●", "ok": "✓"}
+    note_html = "".join(
+        f'<div class="insight {c}"><span class="ic">{icon[c]}</span><div>{t}</div></div>'
+        for c, t in notes
+    )
+
+    if cmp["total_pct"] is None:
+        total_trend = "上期为 0，无法计算环比"
+    else:
+        tp = cmp["total_pct"]
+        arrow = "▲" if tp > 0 else ("▼" if tp < 0 else "＝")
+        total_trend = f"环比 {arrow} {abs(tp):.1f}%"
+
+    return f"""
+<div class="panel">
+  <h2>环比对比 <span class="tag">基准：{E(cmp['label'])}</span></h2>
+  <div class="note">仅对比已归因到业务主线的 token；未归因部分不参与本表。生成方式：传 <code>--compare-json</code> 指向上次 <code>--json-out</code> 的快照。</div>
+  <div style="display:flex;gap:26px;flex-wrap:wrap;margin-bottom:12px;font-size:12px">
+    <div><div style="color:var(--fg3);font-size:11px">总消耗（本期 vs 上期）</div>
+      <div style="font-size:16px;font-weight:650">{fmt(cmp['cur_total'])} <span style="color:var(--fg3);font-weight:400">vs {fmt(cmp['prev_total'])}</span></div>
+      <div style="color:var(--fg3)">{total_trend}</div></div>
+    <div><div style="color:var(--fg3);font-size:11px">缓存命中率</div><div>{_trend(cmp['cur_cache'], cmp['prev_cache'], mode="good_up")}</div></div>
+    <div><div style="color:var(--fg3);font-size:11px">思考 token 占输出</div><div>{_trend(cmp['cur_reason'], cmp['prev_reason'], mode="neutral")}</div></div>
+    <div><div style="color:var(--fg3);font-size:11px">活跃会话数</div><div>{_trend(float(cmp['cur_sessions']), float(cmp['prev_sessions']), '', '—', mode="neutral")}</div></div>
+  </div>
+  <table><thead><tr>
+    <th>业务主线</th><th class="num">本期</th><th class="num">上期</th>
+    <th class="num">Δ</th><th class="num">环比</th>
+  </tr></thead><tbody>{''.join(rows)}</tbody></table>
+  {note_html}
+</div>"""
+
+
 def render_biz(a: dict, meta: dict, pal: list[str], top_n: int) -> str:
     tot_in = sum(a["biz_input"].values())
     tot_out = sum(a["biz_output"].values())
@@ -974,7 +1158,7 @@ def render_audit(audit: dict, pal: list[str]) -> str:
 </div>"""
 
 
-def render_html(data: dict, args) -> str:
+def render_html(data: dict, args, cmp_data: dict | None = None) -> str:
     a, meta, audit = data["agg"], data["meta"], data["audit"]
     pal = palette(args.theme)
     css = CSS + (CSS_DARK if args.theme == "dark" else "")
@@ -995,7 +1179,7 @@ def render_html(data: dict, args) -> str:
 </header>
 
 {render_kpi(a, meta, build_price_index(args.price_cfg))}
-{render_insight(a, meta, args)}
+{render_insight(a, meta, args)}{render_compare(cmp_data, pal)}
 <div class="row">
   {render_biz(a, meta, pal, args.top)}
   <div>{render_reasoning(a, pal)}{render_audit(audit, pal)}</div>
@@ -1073,7 +1257,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("-o", "--out", help="输出 HTML 路径")
-    p.add_argument("--json-out", help="同时导出结构化 JSON 到此路径")
+    p.add_argument("--json-out", help="同时导出结构化 JSON 到此路径，可作下一期 --compare-json 的基准")
+    p.add_argument("--compare-json", help="传入上次 --json-out 的快照路径，生成环比对比面板（周报/月报）；"
+                                          "按期归档不同文件名，勿与 --json-out 同路径")
     p.add_argument("--projects-root", default=DEFAULT_PROJECTS, help="会话日志根目录")
     p.add_argument("--audit-dir", default=DEFAULT_AUDIT, help="审计日志目录")
     p.add_argument("--no-audit", action="store_true", help="跳过审计日志面板")
@@ -1131,7 +1317,17 @@ def main(argv=None) -> int:
         for s in data["sessions"]:
             s["first_msg"] = ""
 
-    html = render_html(data, args)
+    cmp_data = None
+    if args.compare_json:
+        # 同路径 = 先拿旧内容当基准比一次，随即被本期导出覆盖，基准无声丢失 → 直接拦下
+        if args.json_out and os.path.abspath(args.compare_json) == os.path.abspath(args.json_out):
+            raise SystemExit(
+                "[x] --compare-json 与 --json-out 指向同一文件：快照会被本期导出覆盖，对比基准将丢失。\n"
+                "    请按期归档不同文件名，例如 snapshots/2026-09.json 与 snapshots/2026-10.json。"
+            )
+        cmp_data = build_compare(data, load_prev_snapshot(args.compare_json))
+
+    html = render_html(data, args, cmp_data)
     out = args.out or os.path.join(os.getcwd(), "token-dashboard.html")
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
@@ -1161,6 +1357,15 @@ def main(argv=None) -> int:
     if a["biz_input"]:
         top = sorted(a["biz_input"].items(), key=lambda x: -(x[1] + a["biz_output"].get(x[0], 0)))[0]
         print(f"    最大消耗主线   : {top[0]} — {fmt(top[1] + a['biz_output'].get(top[0], 0))}")
+    if cmp_data:
+        arrow = "▲" if cmp_data["total_delta"] > 0 else ("▼" if cmp_data["total_delta"] < 0 else "＝")
+        print(f"    环比（{cmp_data['label']}）: {fmt(cmp_data['prev_total'])} → "
+              f"{fmt(cmp_data['cur_total'])}（{arrow} {fmt(abs(cmp_data['total_delta']))}）")
+        for r in cmp_data["rows"]:
+            if r["status"] == "new":
+                print(f"      🆕 新增主线   : {r['biz']} — {fmt(r['cur'])}")
+            elif r["status"] == "gone":
+                print(f"      已结束主线   : {r['biz']}（上期 {fmt(r['prev'])}，本期为零）")
     if not args.price_cfg:
         print("    [提示] 未传 --price-config，成本列留空（脚本不内置单价）")
     return 0
