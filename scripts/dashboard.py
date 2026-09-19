@@ -73,6 +73,30 @@ def _usage_of(msg: dict) -> dict | None:
     return None
 
 
+def _canon_model(s: str) -> str:
+    """把同一模型的多种写法归一，避免在模型分布表里被拆成多行。
+
+    实测本机同一模型出现过这些写法差异，全部指向同一个模型：
+      "Hy4 preview" / "hy4-preview" / "Hy4-preview"
+      "Deepseek-V4.1-Flash" / "deepseek-v4.1-flash"
+      "GLM-5.3" / "glm-5.3"
+
+    规则（纯函数，必须与调用顺序无关，否则先出现的写法与后出现的写法会再次分裂成两行）：
+    折叠空白 → 空格转 `-` → 每段首字母大写。
+    刻意**不**保留全大写缩写：若对 "GLM" 保留原样、对 "glm" 做首字母大写，
+    这两种写法就仍然归不到同一个 key（实测踩过这个坑）。
+    代价是显示为 "Glm-5.3"，换来的是同一模型只占一行。只影响展示与聚合 key，不改任何 token 数字。
+    """
+    s = " ".join(str(s or "").split())
+    if not s:
+        return "unknown"
+    out = []
+    for seg in s.replace(" ", "-").split("-"):
+        out.append(seg if (not seg or len(seg) == 1 or seg.isdigit())
+                   else seg[:1].upper() + seg[1:].lower())
+    return "-".join(out) or "unknown"
+
+
 def _model_of(msg: dict) -> str:
     pd = msg.get("providerData") or {}
     if not isinstance(pd, dict):
@@ -80,9 +104,9 @@ def _model_of(msg: dict) -> str:
     for k in ("requestModelName", "model", "modelName", "requestModel"):
         v = pd.get(k)
         if isinstance(v, str) and v.strip():
-            return v.strip()
+            return _canon_model(v)
     v = msg.get("model")
-    return v.strip() if isinstance(v, str) and v.strip() else "unknown"
+    return _canon_model(v) if isinstance(v, str) and v.strip() else "unknown"
 
 
 def _detail_token(detail_list, *keys) -> int:
