@@ -46,10 +46,13 @@
 
 ```bash
 # 放进用户级技能目录（三选一）
-git clone https://github.com/g1og1ogo/token-usage-dashboard.git ~/.workbuddy/skills/token-usage-dashboard   # GitHub
-git clone https://gitee.com/myworkbuddy/token-usage-dashboard.git  ~/.workbuddy/skills/token-usage-dashboard  # Gitee 镜像
+git clone https://github.com/g1og1ogo/token-usage-dashboard.git ~/.workbuddy/skills/token-usage-dashboard   # GitHub（主仓库）
+git clone https://gitee.com/myworkbuddy/token-usage-dashboard.git  ~/.workbuddy/skills/token-usage-dashboard  # Gitee（只读镜像）
 cp -r token-usage-dashboard ~/.workbuddy/skills/                                                              # 已下载的目录
 ```
+
+> **主仓库在 GitHub，Gitee 是只读镜像**：Issue / PR / Release 只发生在 GitHub 一侧；Gitee 只为国内 clone 提速，不提 PR。
+> 同一提交的 tree SHA 两边逐一相同，从哪个 clone 都是同一份内容——差异只存在于两次同步之间的时间窗。
 
 环境要求：**Python 3.9+，无任何第三方依赖**（不需要 `pip install`）。WorkBuddy 自带的托管解释器即可：
 
@@ -198,5 +201,5 @@ MIT，见 [`LICENSE`](LICENSE)。
 
 Zero third-party dependencies (Python stdlib only), read-only, no CDN, no network. Ships no built-in price table on purpose: if you do not pass `--price-config`, no monetary column is rendered at all. A `--hide-intent` flag strips raw user utterances before any dashboard is shared externally.
 
-Install: `git clone <repo> ~/.workbuddy/skills/token-usage-dashboard`
+Install: `git clone <repo> ~/.workbuddy/skills/token-usage-dashboard`. The primary repo is GitHub; Gitee is a read-only mirror (no PRs there).
 </details>
