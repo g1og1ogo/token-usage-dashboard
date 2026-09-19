@@ -79,7 +79,36 @@ python scripts/dashboard.py \
     --biz-config ~/.token-dashboard/biz_rules.json \
     --json-out   ./dashboard.json \
     -o           ./token-dashboard.html
+
+# 4) 下一期做环比：传入上一期的 --json-out 快照
+python scripts/dashboard.py \
+    --biz-config ~/.token-dashboard/biz_rules.json \
+    --since 2026-10-01 --until 2026-10-31 \
+    --compare-json ./dashboard.json \
+    --json-out   ./dashboard-2026-10.json \
+    -o           ./token-dashboard.html
 ```
+
+### 跨期对比（周报 / 月报）
+
+`--json-out` 的产物就是下一期的对比基准：用 `--compare-json` 指向上期快照，看板会多出「环比对比」面板——
+
+- 每条业务主线的本期 / 上期 token、增减量与环比百分比（绿降红升）
+- **新增主线**（🆕 本期首次出现消耗）与**已结束主线**（上期有、本期为零——用于区分业务结束还是归因遗漏）
+- 总消耗、缓存命中率、思考占比、活跃会话数四项整体口径的变化
+- 环比波动超过 30% 或缓存率下降 10 个百分点时给出告警
+- **配色与告警方向一致**：缓存命中率上升显绿（对成本有利）；思考占比与活跃会话数用中性色（无明确好坏方向）
+
+```bash
+# 建议每期归档一份快照，形成可比序列
+mkdir -p ~/.token-dashboard/snapshots
+python scripts/dashboard.py ... --json-out ~/.token-dashboard/snapshots/2026-09.json
+python scripts/dashboard.py ... --compare-json ~/.token-dashboard/snapshots/2026-09.json \
+    --json-out ~/.token-dashboard/snapshots/2026-10.json
+```
+
+> 快照要按期归档成**不同文件名**。`--compare-json` 与 `--json-out` 指向同一文件时脚本会**直接报错拦下**——
+> 否则它会先拿旧内容比一次、再被本期导出覆盖，对比基准无声丢失。
 
 > **词典质量决定归因准不准**：写「专有名词 + 产物文件名词根」，别放"公司""报告""方案"这类通用词。
 > 词典必须放在技能目录**之外**，`references/` 下的模板保持中性——否则一份业务布局清单就跟着技能公开了。
@@ -98,7 +127,8 @@ python scripts/dashboard.py \
 | 参数 | 说明 |
 |---|---|
 | `-o, --out` | 输出 HTML 路径（默认当前目录 `token-dashboard.html`） |
-| `--json-out` | 同时导出结构化 JSON，便于二次分析或跨期对比 |
+| `--json-out` | 同时导出结构化 JSON，便于二次分析或跨期对比；按期归档不同文件名即下一期的对比基准 |
+| `--compare-json` | 传入上次 `--json-out` 的快照，生成业务主线环比对比面板（周报 / 月报）；勿与 `--json-out` 同路径 |
 | `--biz-config` | 业务主线词典 JSON |
 | `--price-config` | 模型单价 JSON；**不传则不输出任何金额** |
 | `--since / --until` | 按 `YYYY-MM-DD` 限定区间，做周报 / 月报 |
