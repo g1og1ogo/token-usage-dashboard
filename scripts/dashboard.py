@@ -719,6 +719,9 @@ def collect_traces(args) -> dict:
 
     models: dict[str, dict] = defaultdict(
         lambda: {"input": 0, "output": 0, "cached": 0, "calls": 0, "traces": 0, "dur": 0})
+    by_session: dict[str, dict] = defaultdict(
+        lambda: {"input": 0, "output": 0, "cached": 0, "calls": 0, "dur": 0,
+                 "traces": 0, "errors": 0})
     days: Counter = Counter()
     status: Counter = Counter()
     tok_s_vals: list[float] = []
@@ -730,6 +733,15 @@ def collect_traces(args) -> dict:
         m["calls"] += r["calls"]
         m["traces"] += 1
         m["dur"] += r["duration_ms"]
+        bs = by_session[r["session"]]
+        bs["input"] += r["input"]
+        bs["output"] += r["output"]
+        bs["cached"] += r["cached"]
+        bs["calls"] += r["calls"]
+        bs["dur"] += r["duration_ms"]
+        bs["traces"] += 1
+        if r["status"] not in _OK_STATUS:
+            bs["errors"] += 1
         days[r["day"]] += r["input"] + r["output"]
         status[r["status"]] += 1
         if r["tok_s"] > 0:
@@ -742,6 +754,7 @@ def collect_traces(args) -> dict:
     top = sorted(use, key=lambda r: -(r["input"] + r["output"]))[: args.top_sessions or 10]
     return {
         "models": {k: dict(v) for k, v in models.items()},
+        "by_session": {k: dict(v) for k, v in by_session.items()},
         "days": dict(days),
         "status": dict(status),
         "top": [dict(r) for r in top],
@@ -788,7 +801,8 @@ def collect_db(args) -> dict:
 
     out = {"credit_total": 0.0, "credit_sessions": 0, "days": {}, "by_level": {},
            "by_source": {}, "by_expert": {}, "by_model": {}, "background": [0.0, 0],
-           "sessions": 0, "automations": 0, "automation_runs": [0, 0], "note": ""}
+           "sessions": 0, "automations": 0, "automation_runs": [0, 0], "note": "",
+           "sess_dims": {}}
 
     credit_by_sid: dict[str, tuple[float, str]] = {}
     if "session_usage" in tables:
@@ -814,10 +828,20 @@ def collect_db(args) -> dict:
 
     if "sessions" in tables:
         out["sessions"] = cur.execute("select count(*) from sessions").fetchone()[0]
+        cols = {r[1] for r in cur.execute("pragma table_info(sessions)")}
+        sel = ["id"] + [c for c in ("thought_level", "source_mode", "expert_id", "model",
+                                    "is_background_automation") if c in cols]
+        # session → 维度映射：join_cross 用它把 db 列挂到 projects 会话上。
+        # 只取枚举/布尔列，title/custom_title 等文本列绝不进查询。
+        for row in cur.execute("select {} from sessions".format(", ".join(sel))):
+            g = dict(zip(sel, row))
+            out["sess_dims"][g["id"]] = {
+                "level": g.get("thought_level") or "",
+                "source": g.get("source_mode") or "",
+                "expert": g.get("expert_id") or "",
+                "bg": bool(g.get("is_background_automation")),
+            }
         if credit_by_sid:
-            cols = {r[1] for r in cur.execute("pragma table_info(sessions)")}
-            sel = ["id"] + [c for c in ("thought_level", "source_mode", "expert_id",
-                                        "model", "is_background_automation") if c in cols]
             for row in cur.execute("select {} from sessions".format(", ".join(sel))):
                 g = dict(zip(sel, row))
                 hit = credit_by_sid.get(g["id"])
@@ -846,6 +870,36 @@ def collect_db(args) -> dict:
         out[dim] = {k: [round(v[0], 2), v[1]] for k, v in out[dim].items()}
     out["background"] = [round(out["background"][0], 2), out["background"][1]]
     return out
+
+
+def join_cross(data: dict) -> None:
+    """把 db 维度列与 traces 统计按 session UUID 挂到 projects 会话上，就地修改 data。
+
+    产出 data["cross"]：业务主线 × 思考档位的 token 矩阵——这是单源工具给不出的交叉
+    （projects 有 token 无档位，db 有档位无 token）。
+    关联不上的会话（老日志缺 sessionId）记 "(未关联)"，不丢弃。
+    """
+    sessions = data.get("sessions") or []
+    dims = (data.get("credit") or {}).get("sess_dims") or {}
+    tstat = (data.get("traces") or {}).get("by_session") or {}
+    biz_level: dict[str, Counter] = defaultdict(Counter)
+    levels_tot: Counter = Counter()
+    for s in sessions:
+        d = dims.get(s["sess"]) or {}
+        t = tstat.get(s["sess"]) or {}
+        s["level"] = d.get("level", "")
+        s["source"] = d.get("source", "")
+        s["expert"] = d.get("expert", "")
+        s["bg"] = d.get("bg", False)
+        s["tok_s"] = round(t["output"] * 1000 / t["dur"], 1) if t.get("dur") else 0
+        s["t_errors"] = t.get("errors", 0)
+        lvl = s["level"] or "(未关联)"
+        biz_level[s["biz"]][lvl] += s["in"] + s["out"]
+        levels_tot[lvl] += s["in"] + s["out"]
+    data["cross"] = {
+        "biz_level": {b: dict(v) for b, v in biz_level.items()},
+        "levels": [k for k, _ in levels_tot.most_common()],
+    }
 
 
 # ---------------------------------------------------------------- 格式化
@@ -1316,6 +1370,7 @@ def render_days(a: dict, pal: list[str]) -> str:
 
 def render_top_sessions(data: dict, pal: list[str], top_n: int, hide_intent: bool = False) -> str:
     sess = sorted(data["sessions"], key=lambda s: -(s["in"] + s["out"]))[:top_n or 10]
+    has_dims = any(s.get("level") or s.get("source") for s in sess)
     rows = []
     for i, s in enumerate(sess):
         c = pal[i % len(pal)]
@@ -1324,22 +1379,75 @@ def render_top_sessions(data: dict, pal: list[str], top_n: int, hide_intent: boo
             msg = '<span style="color:var(--fg3)">（已隐藏）</span>'
         else:
             msg = E(s["first_msg"][:52]) if s["first_msg"] else '<span style="color:var(--fg3)">（无记录）</span>'
+        dims = ""
+        if has_dims:
+            lvl = s.get("level") or '<span style="color:var(--fg3)">—</span>'
+            src = s.get("source") or '<span style="color:var(--fg3)">—</span>'
+            tags = []
+            if s.get("bg"):
+                tags.append('<span style="color:#b45309">后台</span>')
+            if s.get("t_errors"):
+                tags.append(f'<span style="color:#dc2626">异常×{s["t_errors"]}</span>')
+            tok_s = f'{s["tok_s"]:,.0f}' if s.get("tok_s") else '<span style="color:var(--fg3)">—</span>'
+            dims = f"""<td>{lvl}{(' ' + ''.join(tags)) if tags else ''}</td>
+<td style="color:var(--fg3)">{src}</td>
+<td class="num">{tok_s}</td>"""
         rows.append(f"""<tr>
 <td class="num" style="color:var(--fg3)">{i + 1}</td>
 <td><span class="dot" style="background:{c}"></span>{E(s['biz'])}</td>
 <td>{msg}</td>
+{dims}
 <td class="num">{fmt(s['in'] + s['out'])}</td>
 <td class="num">{s['count']}</td>
 <td class="num">{100 * s['reasoning'] / max(s['out'], 1):.0f}%</td>
 <td class="num" style="color:var(--fg3)">{when}</td>
 </tr>""")
+    head_dims = '<th>档位</th><th>来源</th><th class="num">tok/s</th>' if has_dims else ""
     return f"""
 <div class="panel">
   <h2>高消耗会话 Top {len(sess)} <span class="tag">按会话粒度</span></h2>
   <table><thead><tr>
-    <th class="num">#</th><th>归主线</th><th>会话首条用户意图</th>
+    <th class="num">#</th><th>归主线</th><th>会话首条用户意图</th>{head_dims}
     <th class="num">合计</th><th class="num">请求</th><th class="num">思考占比</th><th class="num">最近活动</th>
   </tr></thead><tbody>{''.join(rows)}</tbody></table>
+</div>"""
+
+
+def render_cross(data: dict, pal: list[str]) -> str:
+    """业务主线 × 思考档位 的 token 矩阵：projects 的 token × db 的档位，按 session UUID 关联。"""
+    cross = data.get("cross") or {}
+    biz_level = cross.get("biz_level") or {}
+    if not biz_level:
+        return ""
+    levels = (cross.get("levels") or [])[:6]
+    biz_rows = sorted(biz_level.items(), key=lambda x: -sum(x[1].values()))[:10]
+    head = "".join(f'<th class="num">{E(l)}</th>' for l in levels)
+    rows = []
+    dot = '<span style="color:var(--fg3)">·</span>'
+    for i, (b, v) in enumerate(biz_rows):
+        c = pal[i % len(pal)]
+        tot = sum(v.values())
+        cells = "".join(
+            f'<td class="num">{fmt(v[l]) if v.get(l) else dot}</td>'
+            for l in levels)
+        rows.append(f"""<tr>
+<td><span class="dot" style="background:{c}"></span>{E(b)}</td>
+{cells}
+<td class="num"><b>{fmt(tot)}</b></td>
+</tr>""")
+    unmatched = biz_level.get("(未关联)")
+    note = ""
+    if unmatched:
+        n = sum(unmatched.values())
+        note = (f'（未关联档位列 = 老日志无 sessionId，无法连 db，涉及 {fmt(n)} token；'
+                f'不影响其它行的档位分布）')
+    return f"""
+<div class="panel">
+  <h2>业务主线 × 思考档位 <span class="tag">cross：projects × db</span></h2>
+  <div class="note">按 session UUID 把 workbuddy.db 的思考档位挂到 projects 的 token 上{note}。
+    同档位下哪条主线在烧高价推理，一眼可见。</div>
+  <table><thead><tr><th>业务主线</th>{head}<th class="num">合计</th></tr></thead>
+  <tbody>{''.join(rows)}</tbody></table>
 </div>"""
 
 
@@ -1566,6 +1674,7 @@ def render_html(data: dict, args, cmp_data: dict | None = None) -> str:
 {render_models(a, pal, build_price_index(args.price_cfg))}
 {render_traces(tr, pal)}
 {render_credit(cr, pal)}
+{render_cross(data, pal)}
 {render_top_sessions(data, pal, args.top_sessions, args.hide_intent)}
 
 <div class="foot">Token 消耗看板 v{meta['version']} · 单文件离线生成，无外部依赖 ·
@@ -1613,7 +1722,18 @@ def fake_data() -> dict:
             "sess": f"s{i}", "biz": b, "first_msg": f"自检会话 {i} 的示例首条意图文本",
             "last_ts": int((now - dt.timedelta(days=random.randint(0, 10))).timestamp() * 1000),
             "in": si, "out": so, "reasoning": sr, "count": n, "top_model": m,
+            "level": ["high", "high", "xhigh", "disabled"][i % 4],
+            "source": ["craft", "working"][i % 2],
+            "expert": "DemoExpert" if i % 5 == 0 else "",
+            "bg": i % 7 == 0, "tok_s": round(so * 1000 / 60000, 1), "t_errors": 0,
         })
+    cross = {
+        "biz_level": {
+            b: {"high": 3000000, "xhigh": 400000, "disabled": 90000}
+            for b in ["主线 A", "主线 B", "主线 C", "主线 D"]
+        },
+        "levels": ["high", "xhigh", "disabled"],
+    }
     agg["unmatched"] = 12
     traces = {
         "models": {
@@ -1655,6 +1775,7 @@ def fake_data() -> dict:
         "audit": {"command-safety": 812, "network": 41, "file-safety": 6},
         "traces": traces,
         "credit": credit,
+        "cross": cross,
         "meta": {
             "version": VERSION, "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
             "projects_root": "(self-test)", "audit_dir": "(self-test)",
@@ -1737,6 +1858,7 @@ def main(argv=None) -> int:
         data["meta"]["theme"] = args.theme
         data["traces"] = None if args.no_traces else collect_traces(args)
         data["credit"] = None if args.no_db else collect_db(args)
+        join_cross(data)
         if args.price_cfg:
             pass
 
