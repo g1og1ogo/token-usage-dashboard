@@ -27,9 +27,13 @@ agent_created: true
 ## 与环境相关的前提
 
 - 数据源默认：`~/.workbuddy/projects/**/*.jsonl`（请求级 usage）与 `~/.workbuddy/audit-log/*.jsonl`（工具调用类别）
+- 另有两个只读增强源（自动接入，可分别用 `--no-traces` / `--no-db` 关闭）：
+  `~/.workbuddy/traces/*/trace_*.json`（请求级数值层：trace 头的 modelInfo/duration/status，**绝不读取 span 内的 prompt 原文**）；
+  `~/.workbuddy/workbuddy.db`（sqlite 只读：credit 对账 + 思考档位/来源模式/专家/后台自动化交叉维度，**不取 title/prompt 等文本列**）
+- traces 有 30 天清理：运行时会增量归档数值记录到 `~/.token-dashboard/archive/trace_records.jsonl`（仓库外，只存数值），跨期统计因此不受清理影响；`--no-archive` 可关
 - Python 只用标准库，**无需 pip install**。用托管环境解释器即可，形如
   `~/.workbuddy/binaries/python/envs/default/Scripts/python.exe`（Windows 下把 `~` 换成你的用户目录）
-- 全程只读；除输出文件外不改动任何数据
+- 全程只读（db 用 `?mode=ro` 打开）；除输出文件与上述归档外不改动任何数据
 
 ## 工作流
 
@@ -76,6 +80,9 @@ agent_created: true
 | `--price-config` | 传入用户自己的单价表后才会出现「估算成本」列 |
 | `--hide-intent` | **对外交付必开**，见下 |
 | `--no-audit` | 跳过工具调用面板 |
+| `--no-traces` / `--no-db` | 分别跳过 traces 数值层 / credit 对账面板 |
+| `--no-archive` | 不写数值归档（只看当期 traces，不留历史） |
+| `--archive-dir` | 改归档目录（默认 `~/.token-dashboard/archive`） |
 | `--top N` | 业务主线只显示前 N 条 |
 
 ### 第 3 步：核对数字，别急着交付
@@ -188,8 +195,8 @@ git status --porcelain                        # 确认没有把 HTML/JSON 产物
 
 ## 资源
 
-- `scripts/dashboard.py` — 单文件采集 + 归因 + 渲染，零第三方依赖
-- `scripts/check_private.sh` — 发布/分享前的一键隐私自检，五类高危项扫描，命中则非零退出
+- `scripts/dashboard.py` — 单文件采集 + 归因 + 渲染，零第三方依赖（projects + audit-log + traces 数值层 + db 只读）
+- `scripts/check_private.sh` — 发布/分享前的一键隐私自检，六类高危项扫描（含 traces 数值层红线），命中则非零退出
 - `references/biz_names.example.txt` — 隐私自检词表模板（**复制到 `~/.token-dashboard/` 再改写，别就地改**）
 - `references/biz_rules.example.json` — 业务主线词典模板（**应复制改写，不要就地改**）
 - `references/price.example.json` — 单价表模板，数值为占位样例，须替换为用户实际价格

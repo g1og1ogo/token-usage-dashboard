@@ -22,6 +22,7 @@ import glob
 import json
 import os
 import re
+import sqlite3
 import sys
 from collections import Counter, defaultdict
 from html import escape as E
@@ -33,11 +34,15 @@ except Exception:
     pass
 
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 
 HOME = os.path.expanduser("~")
 DEFAULT_PROJECTS = os.path.join(HOME, ".workbuddy", "projects")
 DEFAULT_AUDIT = os.path.join(HOME, ".workbuddy", "audit-log")
+DEFAULT_TRACES = os.path.join(HOME, ".workbuddy", "traces")
+DEFAULT_DB = os.path.join(HOME, ".workbuddy", "workbuddy.db")
+# 数值归档放仓库/技能目录之外：一是抗 traces 的 30 天清理，二是归档绝不随仓库公开
+DEFAULT_ARCHIVE = os.path.join(HOME, ".token-dashboard", "archive")
 
 
 # ---------------------------------------------------------------- 默认业务词典
@@ -596,6 +601,251 @@ def collect_audit(args) -> dict:
         except OSError:
             continue
     return dict(events)
+
+
+# ---------------------------------------------------------------- traces / db 数值层
+# ★ 隐私红线：traces 的 span 内含完整 prompt 原文（tool 输入/输出字段）。
+# 本节只读取 trace 头的数值字段（modelInfo/duration/status），绝不触碰 spans；
+# 归档同样只存数值。check_private.sh 第 3.5 类对「是否读取 prompt 字段」设了硬闸门。
+_OK_STATUS = ("ok", "success", "completed", "完成")
+
+
+def _ms_to_day(v) -> str:
+    try:
+        return dt.datetime.fromtimestamp(int(v) / 1000).strftime("%Y-%m-%d")
+    except Exception:
+        return "未知"
+
+
+def _trace_record(t: dict) -> dict | None:
+    """从 trace 头提取一条数值记录；无 token 或畸形的返回 None。
+
+    只取：traceId/sessionId/startedAt/agentName/status + modelInfo 五个数值。
+    totalTokens 已实测等于 input+output（cached 是 input 子集，不是加项）。
+    """
+    mi = t.get("modelInfo")
+    if not isinstance(mi, dict):
+        return None
+    inp = int(mi.get("totalInputTokens") or 0)
+    out = int(mi.get("totalOutputTokens") or 0)
+    if inp + out <= 0:
+        return None
+    models = mi.get("models") or []
+    dur = int(t.get("duration") or 0)
+    return {
+        "trace_id": t.get("traceId") or "",
+        "session": t.get("sessionId") or "",
+        "day": (t.get("startedAt") or "")[:10] or "未知",
+        "model": _canon_model(models[0]) if models else "(未知)",
+        "agent": t.get("agentName") or "(未知)",
+        "status": t.get("status") or "未知",
+        "input": inp,
+        "output": out,
+        "cached": int(mi.get("totalCachedTokens") or 0),
+        "calls": int(mi.get("callCount") or 0),
+        "duration_ms": dur,
+        "tok_s": round(out * 1000 / dur, 1) if dur > 0 else 0.0,
+    }
+
+
+def _archive_load(path: str) -> dict[str, dict]:
+    recs: dict[str, dict] = {}
+    if not os.path.exists(path):
+        return recs
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    d = json.loads(ln)
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("trace_id"):
+                    recs[d["trace_id"]] = d
+    except OSError:
+        pass
+    return recs
+
+
+def _archive_save(path: str, recs: dict[str, dict]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in sorted(recs.values(), key=lambda x: (x.get("day", ""), x.get("trace_id", ""))):
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def collect_traces(args) -> dict:
+    """扫描 traces 数值层，并维护仓库外归档（抗 30 天清理）。
+
+    容错：同批 trace 格式不一（存在 totalTokens=0、无 modelInfo 的），一律跳过不计。
+    """
+    recs: dict[str, dict] = {}
+    note = ""
+    if not args.no_archive:
+        recs = _archive_load(os.path.join(args.archive_dir, "trace_records.jsonl"))
+
+    before = len(recs)
+    scanned = skipped = 0
+    files = sorted(glob.glob(os.path.join(args.traces_dir, "*", "trace_*.json")))
+    for fp in files:
+        try:
+            with open(fp, encoding="utf-8", errors="replace") as f:
+                d = json.load(f)
+        except Exception:
+            skipped += 1
+            continue
+        scanned += 1
+        t = d.get("trace") if isinstance(d, dict) else None
+        if not isinstance(t, dict):
+            continue
+        r = _trace_record(t)
+        if r and r["trace_id"]:
+            recs[r["trace_id"]] = r
+
+    added = len(recs) - before
+    if not args.no_archive:
+        try:
+            _archive_save(os.path.join(args.archive_dir, "trace_records.jsonl"), recs)
+        except OSError as e:
+            note = f"归档写入失败（不影响本期看板）: {e}"
+
+    since, until = args.since or "", args.until or ""
+    use = [r for r in recs.values()
+           if (not since or r["day"] >= since) and (not until or r["day"] <= until)]
+
+    models: dict[str, dict] = defaultdict(
+        lambda: {"input": 0, "output": 0, "cached": 0, "calls": 0, "traces": 0, "dur": 0})
+    days: Counter = Counter()
+    status: Counter = Counter()
+    tok_s_vals: list[float] = []
+    for r in use:
+        m = models[r["model"]]
+        m["input"] += r["input"]
+        m["output"] += r["output"]
+        m["cached"] += r["cached"]
+        m["calls"] += r["calls"]
+        m["traces"] += 1
+        m["dur"] += r["duration_ms"]
+        days[r["day"]] += r["input"] + r["output"]
+        status[r["status"]] += 1
+        if r["tok_s"] > 0:
+            tok_s_vals.append(r["tok_s"])
+
+    n_err = sum(v for k, v in status.items() if k not in _OK_STATUS)
+    tin = sum(r["input"] for r in use)
+    tout = sum(r["output"] for r in use)
+    tca = sum(r["cached"] for r in use)
+    top = sorted(use, key=lambda r: -(r["input"] + r["output"]))[: args.top_sessions or 10]
+    return {
+        "models": {k: dict(v) for k, v in models.items()},
+        "days": dict(days),
+        "status": dict(status),
+        "top": [dict(r) for r in top],
+        "summary": {
+            "traces": len(use),
+            "input": tin,
+            "output": tout,
+            "cached": tca,
+            "calls": sum(r["calls"] for r in use),
+            "duration_ms": sum(r["duration_ms"] for r in use),
+            "cache_hit": round(100 * tca / tin, 1) if tin else 0,
+            "tok_s_avg": round(sum(tok_s_vals) / len(tok_s_vals), 1) if tok_s_vals else 0,
+            "tok_s_max": max(tok_s_vals) if tok_s_vals else 0,
+            "errors": n_err,
+            "err_rate": round(100 * n_err / len(use), 1) if use else 0,
+        },
+        "meta": {
+            "scanned": scanned,
+            "skipped": skipped,
+            "archived": len(recs),
+            "added": added,
+            "archive_dir": "" if args.no_archive else args.archive_dir,
+        },
+        "note": note,
+    }
+
+
+def collect_db(args) -> dict:
+    """只读 workbuddy.db：credit 对账 + 结构维度交叉。
+
+    ★ 只取数值与枚举列（thought_level/source_mode/expert_id/model/后台标记），
+      绝不读取 sessions.title、prompt 等文本列。
+    credit 的键是匿名 hash、无时间戳无模型 ⇒ 只能按 session_usage 首笔入账日归集，
+    无法细分到模型/当日——精确对账须配合官方用量导出（见 pitfalls.md）。
+    """
+    if not os.path.exists(args.db):
+        return {"note": f"未找到 {args.db}", "credit_total": 0.0}
+    try:
+        con = sqlite3.connect("file:{}?mode=ro".format(args.db.replace("\\", "/")), uri=True)
+        cur = con.cursor()
+        tables = {r[0] for r in cur.execute("select name from sqlite_master where type='table'")}
+    except Exception as e:
+        return {"note": f"db 打开失败（按跳过处理）: {e}", "credit_total": 0.0}
+
+    out = {"credit_total": 0.0, "credit_sessions": 0, "days": {}, "by_level": {},
+           "by_source": {}, "by_expert": {}, "by_model": {}, "background": [0.0, 0],
+           "sessions": 0, "automations": 0, "automation_runs": [0, 0], "note": ""}
+
+    credit_by_sid: dict[str, tuple[float, str]] = {}
+    if "session_usage" in tables:
+        for sid, cj, upd in cur.execute(
+                "select session_id, credit_json, updated_at from session_usage"):
+            if not cj or not sid:
+                continue
+            try:
+                v = sum(float(x) for x in json.loads(cj).values()
+                        if isinstance(x, (int, float)) and not isinstance(x, bool))
+            except Exception:
+                continue
+            if v > 0:
+                credit_by_sid[sid] = (v, _ms_to_day(upd))
+    out["credit_total"] = round(sum(v for v, _ in credit_by_sid.values()), 2)
+    out["credit_sessions"] = len(credit_by_sid)
+
+    def bump(d: dict, k, v: float) -> None:
+        k = k if k not in (None, "") else "(默认)"
+        cell = d.setdefault(k, [0.0, 0])
+        cell[0] += v
+        cell[1] += 1
+
+    if "sessions" in tables:
+        out["sessions"] = cur.execute("select count(*) from sessions").fetchone()[0]
+        if credit_by_sid:
+            cols = {r[1] for r in cur.execute("pragma table_info(sessions)")}
+            sel = ["id"] + [c for c in ("thought_level", "source_mode", "expert_id",
+                                        "model", "is_background_automation") if c in cols]
+            for row in cur.execute("select {} from sessions".format(", ".join(sel))):
+                g = dict(zip(sel, row))
+                hit = credit_by_sid.get(g["id"])
+                if not hit:
+                    continue
+                v, day = hit
+                bump(out["days"], day, v)
+                for col, dim in (("thought_level", "by_level"), ("source_mode", "by_source"),
+                                 ("expert_id", "by_expert")):
+                    if col in g:
+                        bump(out[dim], g[col], v)
+                if "model" in g:
+                    bump(out["by_model"], _canon_model(g["model"] or "(未知)"), v)
+                if g.get("is_background_automation"):
+                    out["background"][0] += v
+                    out["background"][1] += 1
+    if "automations" in tables:
+        out["automations"] = cur.execute("select count(*) from automations").fetchone()[0]
+    if "automation_runs" in tables:
+        n, ok = cur.execute(
+            "select count(*), coalesce(sum(result_success), 0) from automation_runs").fetchone()
+        out["automation_runs"] = [int(n or 0), int(ok or 0)]
+    con.close()
+
+    for dim in ("days", "by_level", "by_source", "by_expert", "by_model"):
+        out[dim] = {k: [round(v[0], 2), v[1]] for k, v in out[dim].items()}
+    out["background"] = [round(out["background"][0], 2), out["background"][1]]
+    return out
 
 
 # ---------------------------------------------------------------- 格式化
@@ -1158,8 +1408,134 @@ def render_audit(audit: dict, pal: list[str]) -> str:
 </div>"""
 
 
+# ---------------------------------------------------------------- traces / credit 渲染
+def render_traces(tr: dict | None, pal: list[str]) -> str:
+    if not tr or not tr.get("summary") or not tr["summary"].get("traces"):
+        return ""
+    s = tr["summary"]
+    meta = tr["meta"]
+
+    mrows = []
+    models = sorted(tr["models"].items(), key=lambda x: -(x[1]["input"] + x[1]["output"]))
+    mx = max((m["input"] + m["output"] for _, m in models), default=1) or 1
+    for i, (name, m) in enumerate(models[:12]):
+        c = pal[i % len(pal)]
+        tot = m["input"] + m["output"]
+        hit = 100 * m["cached"] / m["input"] if m["input"] else 0
+        tps = m["output"] * 1000 / m["dur"] if m["dur"] else 0
+        mrows.append(f"""<tr>
+<td><span class="dot" style="background:{c}"></span>{E(name)}</td>
+<td class="num">{fmt(m['input'])}</td>
+<td class="num">{fmt(m['output'])}</td>
+<td class="num">{fmt(m['cached']) if m['cached'] else '—'}</td>
+<td class="num">{hit:.1f}%</td>
+<td class="num">{m['calls']:,}</td>
+<td class="num">{tps:,.0f}</td>
+<td><div class="bar"><span style="width:{100 * tot / mx:.1f}%;background:{c}"></span></div></td>
+</tr>""")
+
+    trows = []
+    for r in tr.get("top", []):
+        bad = r["status"] not in _OK_STATUS
+        st = f'<span style="color:#dc2626;font-weight:600">{E(r["status"])}</span>' if bad else E(r["status"])
+        trows.append(f"""<tr>
+<td class="num">{E(r['day'])}</td>
+<td title="{E(r['trace_id'])}">…{E(r['trace_id'][-6:])}</td>
+<td>{E(r['model'])}</td>
+<td>{E(r['agent'])}</td>
+<td class="num">{fmt(r['input'] + r['output'])}</td>
+<td class="num">{r['calls']:,}</td>
+<td class="num">{r['tok_s']:,.0f}</td>
+<td>{st}</td>
+</tr>""")
+
+    err_html = (f'<span style="color:#dc2626;font-weight:600">异常 {s["errors"]} 个（{s["err_rate"]}%）'
+                f'</span>') if s["errors"] else "全部正常"
+    arch = (f'归档 {meta["archived"]:,} 条（本次新增 {meta["added"]:,}），抗 30 天清理'
+            if meta.get("archive_dir") else "未启用归档（--no-archive）")
+    note = f' <span style="color:#b45309">⚠ {E(tr["note"])}</span>' if tr.get("note") else ""
+    return f"""
+<div class="panel">
+  <h2>请求级明细 <span class="tag">traces 数值层</span></h2>
+  <div class="note">数据源：~/.workbuddy/traces，仅数值字段（prompt 原文不读取）；{arch}。{note}</div>
+  <div style="display:flex;gap:24px;margin:12px 0;flex-wrap:wrap">
+    <div><div style="color:var(--fg3);font-size:11px">trace 数 / 模型调用</div>
+      <div style="font-size:19px;font-weight:650">{s['traces']:,} / {s['calls']:,}</div></div>
+    <div><div style="color:var(--fg3);font-size:11px">trace 口径总量</div>
+      <div style="font-size:19px;font-weight:650">{fmt(s['input'] + s['output'])}</div></div>
+    <div><div style="color:var(--fg3);font-size:11px">缓存命中率</div>
+      <div style="font-size:19px;font-weight:650">{s['cache_hit']:.1f}%</div></div>
+    <div><div style="color:var(--fg3);font-size:11px">平均 / 峰值 tok/s</div>
+      <div style="font-size:19px;font-weight:650">{s['tok_s_avg']:,.0f} / {s['tok_s_max']:,.0f}</div></div>
+    <div><div style="color:var(--fg3);font-size:11px">状态</div>
+      <div style="font-size:13px;font-weight:650">{err_html}</div></div>
+  </div>
+  <table><thead><tr><th>模型</th><th class="num">输入</th><th class="num">输出</th>
+    <th class="num">缓存命中</th><th class="num">命中率</th><th class="num">调用次数</th>
+    <th class="num">tok/s</th><th>分布</th></tr></thead>
+  <tbody>{''.join(mrows)}</tbody></table>
+  <h2 style="margin-top:18px">高消耗 trace Top {len(tr.get('top', []))}</h2>
+  <table><thead><tr><th class="num">日期</th><th>trace</th><th>模型</th><th>agent</th>
+    <th class="num">总 token</th><th class="num">调用</th><th class="num">tok/s</th><th>状态</th></tr></thead>
+  <tbody>{''.join(trows)}</tbody></table>
+</div>"""
+
+
+def render_credit(db: dict | None, pal: list[str]) -> str:
+    if not db or not db.get("credit_total"):
+        return ""
+
+    def dim_table(title: str, d: dict) -> str:
+        if not d:
+            return ""
+        items = sorted(d.items(), key=lambda x: -x[1][0])[:10]
+        mx = max(v[0] for _, v in items) or 1
+        tot = sum(v[0] for _, v in items)
+        rows = []
+        for i, (k, (v, n)) in enumerate(items):
+            c = pal[i % len(pal)]
+            rows.append(f"""<tr>
+<td><span class="dot" style="background:{c}"></span>{E(k)}</td>
+<td class="num">{v:,.1f}</td>
+<td class="num">{n}</td>
+<td class="num">{100 * v / max(tot, 1e-9):.1f}%</td>
+<td><div class="bar"><span style="width:{100 * v / mx:.1f}%;background:{c}"></span></div></td>
+</tr>""")
+        return f"""<h2 style="margin-top:14px">{title}</h2>
+  <table><thead><tr><th>维度</th><th class="num">credit</th><th class="num">会话数</th>
+    <th class="num">占比</th><th>分布</th></tr></thead>
+  <tbody>{''.join(rows)}</tbody></table>"""
+
+    days = sorted(db.get("days", {}))
+    day_note = " · ".join(f"{d} <b>{db['days'][d][0]:,.0f}</b>" for d in days[-7:]) or "—"
+    bg = db.get("background", [0.0, 0])
+    runs = db.get("automation_runs", [0, 0])
+    note = f" {E(db['note'])}" if db.get("note") else ""
+    return f"""
+<div class="panel">
+  <h2>Credit 对账 <span class="tag">workbuddy.db 只读</span></h2>
+  <div class="note">数据源：~/.workbuddy/workbuddy.db（sqlite 只读，不取文本列）。credit 按首笔入账日归集，键为匿名 hash、无模型维度——精确对账请配合官方用量导出。{note}</div>
+  <div style="display:flex;gap:24px;margin:12px 0;flex-wrap:wrap">
+    <div><div style="color:var(--fg3);font-size:11px">credit 合计</div>
+      <div style="font-size:19px;font-weight:650">{db['credit_total']:,.1f}</div></div>
+    <div><div style="color:var(--fg3);font-size:11px">计费会话</div>
+      <div style="font-size:19px;font-weight:650">{db.get('credit_sessions', 0):,} / {db.get('sessions', 0):,}</div></div>
+    <div><div style="color:var(--fg3);font-size:11px">后台自动化</div>
+      <div style="font-size:19px;font-weight:650">{bg[0]:,.1f} / {bg[1]} 会话</div></div>
+    <div><div style="color:var(--fg3);font-size:11px">自动化运行</div>
+      <div style="font-size:19px;font-weight:650">{runs[0]} 次（成功 {runs[1]}）</div></div>
+  </div>
+  <div class="note">近 {min(7, len(days))} 天入账：{day_note}</div>
+  {dim_table('按思考档位', db.get('by_level'))}
+  {dim_table('按来源模式', db.get('by_source'))}
+  {dim_table('按专家', db.get('by_expert'))}
+  {dim_table('按模型', db.get('by_model'))}
+</div>"""
+
+
 def render_html(data: dict, args, cmp_data: dict | None = None) -> str:
     a, meta, audit = data["agg"], data["meta"], data["audit"]
+    tr, cr = data.get("traces"), data.get("credit")
     pal = palette(args.theme)
     css = CSS + (CSS_DARK if args.theme == "dark" else "")
     title = E(args.title)
@@ -1172,6 +1548,8 @@ def render_html(data: dict, args, cmp_data: dict | None = None) -> str:
 <header>
   <div><h1>{title}</h1>
     <div class="sub">数据源：{E(meta['projects_root'])} ＋ {E(meta['audit_dir'] or '（未启用）')}
+      {(' ＋ traces 数值层' if tr and tr.get('summary') else '')}
+      {(' ＋ credit 对账' if cr and cr.get('credit_total') else '')}
       · 扫描 {meta['files_scanned']} 个日志文件 / {meta['records']:,} 条有效 usage
       · 会话 {meta['sessions_total']}</div></div>
   <div class="sub" style="text-align:right">生成于 {meta['generated_at']}
@@ -1186,10 +1564,12 @@ def render_html(data: dict, args, cmp_data: dict | None = None) -> str:
 </div>
 {render_days(a, pal)}
 {render_models(a, pal, build_price_index(args.price_cfg))}
+{render_traces(tr, pal)}
+{render_credit(cr, pal)}
 {render_top_sessions(data, pal, args.top_sessions, args.hide_intent)}
 
 <div class="foot">Token 消耗看板 v{meta['version']} · 单文件离线生成，无外部依赖 ·
-  数据全部来自本机会话日志，未上传任何内容</div>
+  数据全部来自本机会话日志 / traces 数值层 / workbuddy.db，未上传任何内容</div>
 </div></body></html>"""
 
 
@@ -1235,10 +1615,46 @@ def fake_data() -> dict:
             "in": si, "out": so, "reasoning": sr, "count": n, "top_model": m,
         })
     agg["unmatched"] = 12
+    traces = {
+        "models": {
+            "model-alpha": {"input": 5200000, "output": 210000, "cached": 4300000,
+                            "calls": 320, "traces": 18, "dur": 900000},
+            "model-beta": {"input": 1800000, "output": 96000, "cached": 900000,
+                           "calls": 140, "traces": 9, "dur": 700000},
+        },
+        "days": {"2026-09-18": 3200000, "2026-09-19": 3980000},
+        "status": {"ok": 26, "error": 1},
+        "top": [
+            {"trace_id": f"trace_selftest{i:04d}", "day": "2026-09-19",
+             "model": "model-alpha" if i % 2 == 0 else "model-beta", "agent": "cli",
+             "status": "ok" if i else "error", "input": 690000 - i * 20000,
+             "output": 3500, "cached": 600000, "calls": 66, "duration_ms": 128000,
+             "tok_s": 27.3}
+            for i in range(3)
+        ],
+        "summary": {"traces": 27, "input": 7000000, "output": 306000, "cached": 5200000,
+                    "calls": 460, "duration_ms": 1600000, "cache_hit": 74.3,
+                    "tok_s_avg": 45.2, "tok_s_max": 210.0, "errors": 1, "err_rate": 3.7},
+        "meta": {"scanned": 27, "skipped": 0, "archived": 27, "added": 0,
+                 "archive_dir": "(self-test)"},
+        "note": "",
+    }
+    credit = {
+        "credit_total": 4042.0, "credit_sessions": 111,
+        "days": {"2026-09-19": [320.5, 9], "2026-09-20": [289.0, 8]},
+        "by_level": {"high": [2220.2, 79], "xhigh": [488.2, 4], "disabled": [59.3, 6]},
+        "by_source": {"craft": [2806.0, 91], "working": [1236.1, 23]},
+        "by_expert": {"RemotionVideoExpert": [49.0, 1]},
+        "by_model": {"glm-5.3": [1560.0, 10], "hy4-preview": [903.0, 70]},
+        "background": [113.7, 2], "sessions": 114, "automations": 1,
+        "automation_runs": [16, 12], "note": "",
+    }
     return {
         "agg": aggregate_to_plain(agg),
         "sessions": sessions,
         "audit": {"command-safety": 812, "network": 41, "file-safety": 6},
+        "traces": traces,
+        "credit": credit,
         "meta": {
             "version": VERSION, "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
             "projects_root": "(self-test)", "audit_dir": "(self-test)",
@@ -1263,6 +1679,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--projects-root", default=DEFAULT_PROJECTS, help="会话日志根目录")
     p.add_argument("--audit-dir", default=DEFAULT_AUDIT, help="审计日志目录")
     p.add_argument("--no-audit", action="store_true", help="跳过审计日志面板")
+    p.add_argument("--traces-dir", default=DEFAULT_TRACES,
+                   help="traces 根目录（请求级数值层；span 内含 prompt 原文，本工具只读 trace 头数值字段）")
+    p.add_argument("--db", default=DEFAULT_DB,
+                   help="workbuddy.db 路径（credit 对账与结构维度，sqlite 只读，不取文本列）")
+    p.add_argument("--archive-dir", default=DEFAULT_ARCHIVE,
+                   help="数值归档目录（仓库外，抗 traces 30 天清理；只存数值字段）")
+    p.add_argument("--no-traces", action="store_true", help="跳过 traces 数值层面板")
+    p.add_argument("--no-db", action="store_true", help="跳过 credit 对账面板")
+    p.add_argument("--no-archive", action="store_true", help="不写数值归档（只看当期 traces）")
     p.add_argument("--include-root", action="store_true", help="一并扫描 projects 根目录下的 jsonl")
     p.add_argument("--biz-config", help="业务主线词典 JSON（见 references/biz_rules.example.json）")
     p.add_argument("--price-config", help="模型单价 JSON（见 references/price.example.json；不传则不输出金额）")
@@ -1310,6 +1735,8 @@ def main(argv=None) -> int:
             print(f"[·] 扫描 {args.projects_root} ...")
         data = collect(args, biz)
         data["meta"]["theme"] = args.theme
+        data["traces"] = None if args.no_traces else collect_traces(args)
+        data["credit"] = None if args.no_db else collect_db(args)
         if args.price_cfg:
             pass
 
@@ -1366,6 +1793,19 @@ def main(argv=None) -> int:
                 print(f"      🆕 新增主线   : {r['biz']} — {fmt(r['cur'])}")
             elif r["status"] == "gone":
                 print(f"      已结束主线   : {r['biz']}（上期 {fmt(r['prev'])}，本期为零）")
+    tr = data.get("traces")
+    if tr and tr.get("summary") and tr["summary"].get("traces"):
+        s = tr["summary"]
+        print(f"    traces 数值层   : {s['traces']:,} 条 / {s['calls']:,} 次调用，"
+              f"命中率 {s['cache_hit']:.1f}%，tok/s 均值 {s['tok_s_avg']:,.0f}"
+              f"（归档 {tr['meta']['archived']:,}，新增 {tr['meta']['added']:,}）")
+        if s["errors"]:
+            print(f"      ⚠ 异常 trace : {s['errors']} 个（{s['err_rate']}%），见请求级明细面板")
+    cr = data.get("credit")
+    if cr and cr.get("credit_total"):
+        print(f"    credit 对账     : 合计 {cr['credit_total']:,.1f} / "
+              f"{cr.get('credit_sessions', 0)} 计费会话"
+              f"（后台自动化 {cr['background'][0]:,.1f} / {cr['background'][1]} 会话）")
     if not args.price_cfg:
         print("    [提示] 未传 --price-config，成本列留空（脚本不内置单价）")
     return 0

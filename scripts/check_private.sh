@@ -64,6 +64,17 @@ check "身份证号" '[0-9]{17}[0-9Xx]'
 check "统一社会信用代码" '9[0-9A-Z]{17}'
 check "私钥/AK/SK" 'BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}'
 
+echo "---- 3.5 traces 数值层红线 ----"
+# traces 的 span 内含完整 prompt 原文；dashboard.py 只允许取 trace 头数值字段。
+# 这里卡住的是「字段访问语法」而非注释里的字样——注释提到字段名是允许的，
+# 但凡出现对 tool 输入/输出字段的下标访问，即视为把 prompt 原文引入了处理链路。
+if grep -nE "\[\s*['\"]tool(Input|Output)['\"]\s*\]" scripts/dashboard.py 2>/dev/null; then
+  printf "  [HIT ]  dashboard.py 访问了 traces 的 tool 输入/输出字段（prompt 原文）——只允许数值字段\n"
+  flag=1
+else
+  printf "  [ OK ]  traces 仅数值字段（无 prompt 字段访问）\n"
+fi
+
 echo "---- 4. 本地工作路径 ----"
 # 你的本机工作目录同样属于不该公开的信息，和业务词表放同一份清单里（前缀 local:）
 LOCAL_PATHS_FILE="${LOCAL_PATHS_FILE:-$HOME/.token-dashboard/local_paths.txt}"

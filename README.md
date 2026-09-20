@@ -119,8 +119,14 @@ python scripts/dashboard.py ... --compare-json ~/.token-dashboard/snapshots/2026
 |---|---|
 | `~/.workbuddy/projects/**/*.jsonl` | 请求级 usage（输入 / 输出 / 缓存 / 思考 token） |
 | `~/.workbuddy/audit-log/*.jsonl` | 工具调用类别分布 |
+| `~/.workbuddy/traces/*/trace_*.json` | 请求级数值层：trace 头的 modelInfo / duration / status——缓存命中率、tok/s、错误监控、高消耗 trace 下钻。**只读数值字段，span 内的 prompt 原文不触碰** |
+| `~/.workbuddy/workbuddy.db` | credit 对账（按思考档位 / 来源模式 / 专家 / 后台自动化交叉），sqlite `?mode=ro` 只读，**不取 title/prompt 等文本列** |
 
-**全程只读**，除你指定的输出文件外不改动任何数据；不联网。
+traces 有 30 天清理：每次运行把数值记录增量归档到仓库外的
+`~/.token-dashboard/archive/trace_records.jsonl`（按 trace_id 去重，只存 12 个数值/枚举字段），
+跨期统计因此不受清理影响。`--no-traces` / `--no-db` / `--no-archive` 可分别关闭。
+
+**全程只读**，除你指定的输出文件与上述归档外不改动任何数据；不联网。
 
 ## 主要参数
 
@@ -138,6 +144,9 @@ python scripts/dashboard.py ... --compare-json ~/.token-dashboard/snapshots/2026
 | `--top-sessions N` | 高消耗会话显示条数（默认 10） |
 | `--top N` | 业务主线只显示前 N 条（0 = 全部） |
 | `--no-audit` | 跳过工具调用面板 |
+| `--no-traces` / `--no-db` | 跳过 traces 数值层 / credit 对账面板 |
+| `--no-archive` | 不写数值归档（只看当期 traces） |
+| `--archive-dir` | 数值归档目录（默认 `~/.token-dashboard/archive`） |
 | `--projects-root` / `--audit-dir` | 覆盖默认日志目录（换宿主或做归档分析时用） |
 | `--include-root` | 一并扫描 projects 根目录下的 jsonl |
 | `--quiet` | 只在结尾输出成品路径，适合挂进脚本 |

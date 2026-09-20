@@ -162,3 +162,36 @@ Top 会话表展示的是**真实的 `<user_query>` 原文**。实测本机数�
 
 **代价**：显示为 `Glm-5.3` 而不是 `GLM-5.3`。可接受——同一模型只占一行比大小写好看重要。
 改动只影响展示与聚合 key，**不改变任何 token 数字**，故历史快照可继续用于 `--compare-json`。
+
+## 12. traces 只能取数值层，span 里躺着完整 prompt 原文
+
+traces 的 `generation` span 的 tool 输入/输出字段就是**整份系统提示 + 用户上下文原文**（实测直接可见）。
+一旦为了"归因更准"去读 span，产出物的泄露面比现在大一个量级，且 JSON 导出会原样带出去。
+
+**红线**：只读 trace 头的 `modelInfo`（totalInput/Output/CachedTokens、callCount）、
+`duration`、`status`、`startedAt`、`agentName`、`sessionId`、`traceId`；**永不触碰 spans**。
+`check_private.sh` 第 3.5 类用「字段下标访问语法」卡这道线（注释里提到字段名不算违规）。
+
+**两个实测口径**（写文档或对外解释前先记住）：
+- `totalTokens == totalInputTokens + totalOutputTokens`（本机 44/44 条全等）；cached 是 input 的**子集**，不是加项。
+  凡声称"totalTokens = 输入+输出+缓存"的文档（包括某些第三方 DATA-GUIDE）是错的。
+- trace 的 input 是**一次 workflow 内 callCount 次调用的累计**；projects jsonl 的 usage 是逐条请求的。
+  两边总量天然不同，不是谁丢数据——对比前先定口径。
+
+**同批格式不一**：存在 `totalTokens=0`、无 `modelInfo` 的 trace，解析必须容错（缺字段跳过，不中断）。
+
+## 13. credit 只能归到"会话首笔入账日"，归不到模型/当日
+
+`session_usage.credit_json` 的键是 32 位匿名 hash，**无时间戳、无模型名**；能关联到的日期只有
+`session_usage.updated_at`（epoch 毫秒）≈ 首笔入账日。所以 credit 对账的上限是
+「日 × 思考档位 × 来源模式 × 专家 × 模型 × 后台自动化」，再往下细就要接官方用量页导出了。
+
+**隐私**：`sessions` 表有 `title`/`custom_title`（会话标题，本质是用户首条 prompt 的摘要）——
+只取枚举/数值列（thought_level、source_mode、expert_id、model、is_background_automation），
+title 绝不进 SQL 查询列。
+
+## 14. traces 有 30 天清理，跨期统计必须先自建归档
+
+traces 目录会清理，"全期 × 请求级"永远拿不到——除非每次运行把数值记录增量归档到仓库外
+（默认 `~/.token-dashboard/archive/trace_records.jsonl`，按 trace_id 去重合并）。
+归档**只存 12 个数值/枚举字段**，本身无泄露面，但不要因此把它挪进仓库或发出去。
